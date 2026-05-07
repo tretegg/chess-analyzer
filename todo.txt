@@ -1,0 +1,5 @@
+Categorize moves (e.g great, brilliant, mistake)
+
+Add move history with notation and engine scores
+
+Make AI responses more concise and add best move arrow
