@@ -83,9 +83,10 @@
                 analyzeCurrentPosition(); 
             }
             
-            const pvMatch = line.match(/ pv ([a-h][1-8])([a-h][1-8])/);
+            const pvMatch = line.match(/ pv (.*)/);
             if (pvMatch) {
-                bestMoveString = pvMatch[1] + pvMatch[2]; 
+                // Captures the entire sequence of best future moves (e.g. "e2e4 e7e5 g1f3")
+                bestMoveString = pvMatch[1].trim(); 
             }
 
             if (line.includes('score cp')) {
@@ -239,16 +240,23 @@
         const change = currentMoveIndex > 0 ? (evalScore / 100) - (moveHistory[currentMoveIndex - 1].eval! / 100) : 0;
         
         try {
+            // Get the last 4 moves leading up to this position for context
+            const recentMoves = moveHistory
+                .slice(Math.max(0, currentMoveIndex - 3), currentMoveIndex + 1)
+                .map(m => m.san).join(" ");
+
             const response = await fetch('/api/explain', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     fen: fen,
-                    move: moveHistory[currentMoveIndex]?.san || "Start of game",
+                    movePlayed: moveHistory[currentMoveIndex]?.san || "Start of game",
+                    recentMoves: recentMoves,
                     evalChange: change.toFixed(2),
-                    bestMove: bestMoveString
+                    engineLine: bestMoveString
                 })
             });
+            
             const resData = await response.json();
             explanation = resData.explanation;
         } catch (error) {
@@ -280,34 +288,6 @@
         pts.push(`100,100`);
         pts.push(`0,100`);
         return pts.join(" ");
-    });
-
-    // Calculate coordinates and colors for important move markers
-    let graphMarkers = $derived.by(() => {
-        let markers: { x: number, y: number, color: string }[] = [];
-        const total = moveHistory.length;
-        if (total === 0) return markers;
-
-        for (let i = 0; i < total; i++) {
-            const move = moveHistory[i];
-            // REMOVED 'best' to declutter the graph
-            if (move.classification && ['brilliant', 'inaccuracy', 'mistake', 'blunder'].includes(move.classification)) {
-                let cp = move.eval !== undefined ? move.eval : startEval;
-                let wp = 50 + 50 * (2 / (1 + Math.exp(-0.004 * cp)) - 1);
-                
-                let x = ((i + 1) / total) * 100;
-                let y = 100 - wp;
-                
-                let color = '#94a3b8'; // fallback
-                if (move.classification === 'blunder') color = '#ef4444';
-                else if (move.classification === 'mistake') color = '#fb923c';
-                else if (move.classification === 'inaccuracy') color = '#facc15';
-                else if (move.classification === 'brilliant') color = '#2dd4bf';
-
-                markers.push({ x, y, color });
-            }
-        }
-        return markers;
     });
 
     function handleGraphClick(event: MouseEvent) {
@@ -382,20 +362,11 @@
         <div class="graph-container">
             <button class="graph-btn" aria-label="Evaluation Graph" onclick={handleGraphClick}>
                 <svg viewBox="0 0 100 100" preserveAspectRatio="none" class="eval-svg">
-                    <rect x="0" y="0" width="100" height="100" fill="#f1f5f9" />
-                    <polygon points={graphPolygon} fill="#334155" />
+                    <rect x="0" y="0" width="100" height="100" fill="#334155" />
+                    <polygon points={graphPolygon} fill="#f1f5f9" />
+                    
                     <line x1="0" y1="50" x2="100" y2="50" stroke="#64748b" stroke-width="0.5" stroke-dasharray="2,2" />
-                    
-                    {#each graphMarkers as marker}
-                        <circle 
-                            cx={marker.x} 
-                            cy={marker.y} 
-                            r="1.5" 
-                            fill={marker.color} 
-                            stroke="#0f1115" 
-                            stroke-width="0.4" />
-                    {/each}
-                    
+
                     {#if currentMoveIndex >= -1}
                         <line 
                             x1={((currentMoveIndex + 1) / Math.max(1, moveHistory.length)) * 100} 
@@ -438,7 +409,11 @@
         <div class="notation-panel">
             <div class="controls">
                 <button class="nav-btn" onclick={prevMove}>&larr; Prev</button>
-                <div class="move-counter">Move {currentMoveIndex + 1}</div>
+                <div class="move-counter">
+                    {currentMoveIndex >= 0 
+                        ? `Move ${Math.floor(currentMoveIndex / 2) + 1} (${currentMoveIndex % 2 === 0 ? 'White' : 'Black'})` 
+                        : 'Start Position'}
+                </div>
                 <button class="nav-btn" onclick={nextMove}>Next &rarr;</button>
             </div>
             
@@ -587,33 +562,6 @@
     .mistake { color: #fb923c; }   .badge.mistake { background: #fb923c; color: #000;} 
     .blunder { color: #ef4444; }   .badge.blunder { background: #ef4444; font-size: 0.7rem; color: #000;} 
 
-    .badge { 
-        width: 22px; 
-        height: 22px; 
-        min-width: 22px; /* CRITICAL: Forces it to stay perfectly round */
-        min-height: 22px; /* CRITICAL: Prevents vertical squishing */
-        display: inline-flex; 
-        align-items: center; 
-        justify-content: center; 
-        border-radius: 50%; 
-        font-weight: 800; 
-        flex-shrink: 0; /* Prevents flexbox from crushing it */
-        line-height: 1; 
-        margin-left: 4px;
-    }
-
-    .eval-text { 
-        font-family: monospace; 
-        font-size: 0.8rem; 
-        color: #64748b; 
-        font-weight: 600; 
-        flex-shrink: 0; /* Prevents the score from wrapping/squishing */
-    }
-
-    .move-btn.active .eval-text { 
-        color: #93c5fd; 
-    }
-
     .main-stage { 
         flex-grow: 1; 
         display: flex; 
@@ -682,7 +630,33 @@
         white-space: nowrap; 
         overflow: hidden; 
         text-overflow: ellipsis; 
-        flex-grow: 1; /* Pushes the eval score and badge to the right */
+        flex: 1 1 auto; /* Allows it to grow and shrink dynamically */
+    }
+
+    .eval-text { 
+        font-family: monospace; 
+        font-size: 0.8rem; 
+        color: #64748b; 
+        font-weight: 600; 
+        flex: 0 0 auto; /* Completely refuses to shrink or grow */
+    }
+    
+    .move-btn.active .eval-text { 
+        color: #93c5fd; 
+    }
+
+    .badge { 
+        width: 22px !important; 
+        height: 22px !important; 
+        flex: 0 0 22px !important; /* CRITICAL: Absolutely refuses to squish */
+        box-sizing: border-box;
+        display: inline-flex; 
+        align-items: center; 
+        justify-content: center; 
+        border-radius: 50%; 
+        font-weight: 800; 
+        line-height: 1; 
+        margin-left: 4px;
     }
 
     
