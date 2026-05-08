@@ -7,8 +7,8 @@
     let { data }: { data: PageData } = $props();
 
     let chess = new Chess();
-    let fen = $state(chess.fen()); 
-    
+    let fen = $state(chess.fen());
+
     // 1. REDUCED POSITIVE CATEGORIES
     interface MoveRecord {
         fen: string;
@@ -19,7 +19,7 @@
     }
     let moveHistory = $state<MoveRecord[]>([]);
     let currentMoveIndex = $state(-1);
-    
+
     let pairedMoves = $derived.by(() => {
         const pairs = [];
         for (let i = 0; i < moveHistory.length; i += 2) {
@@ -44,26 +44,22 @@
     let whiteAdvantagePercent = $state(50); 
     let isEngineReady = $state(false);
     let analysisTimer: ReturnType<typeof setTimeout>;
-    
-    // 2. BULLETPROOF ARROW CONFIGURATION
-    let bestMoveShape = $state<any[]>([]); 
+
     let bestMoveString = $state("");
-    let drawableConfig = $derived({ shapes: bestMoveShape, enabled: true, visible: true });
+    let drawableConfig = $derived({ enabled: true, visible: true });
 
     let bgEngine: Worker;
     let bgMoveIndex = $state(0);
     let isAnalyzingGame = $state(false);
     let bgSessionId = $state(0); 
-    
-    let whiteAccuracy = $state(0);
-    let blackAccuracy = $state(0);
+    let startEval = $state(0);
 
     let explanation = $state("");
     let isThinking = $state(false);
 
     let currentClassification = $derived(currentMoveIndex >= 0 ? moveHistory[currentMoveIndex]?.classification : null);
     let currentSan = $derived(currentMoveIndex >= 0 ? moveHistory[currentMoveIndex]?.san : null);
-    
+
     let moveStatusText = $derived.by(() => {
         if (currentClassification && currentSan) {
             if (['brilliant', 'best', 'good'].includes(currentClassification)) {
@@ -90,7 +86,6 @@
             const pvMatch = line.match(/ pv ([a-h][1-8])([a-h][1-8])/);
             if (pvMatch) {
                 bestMoveString = pvMatch[1] + pvMatch[2]; 
-                bestMoveShape = [{ orig: pvMatch[1], dest: pvMatch[2], brush: 'green' }];
             }
 
             if (line.includes('score cp')) {
@@ -112,31 +107,45 @@
             const line = event.data;
             if (line === 'uciok') bgEngine.postMessage('isready');
             
-            if (line.includes('score cp') && isAnalyzingGame) {
-                const match = line.match(/score cp (-?\d+)/);
-                if (match && bgMoveIndex >= 0 && bgMoveIndex < moveHistory.length) {
-                    let cp = parseInt(match[1]);
-                    const sideToMove = moveHistory[bgMoveIndex].fen.split(' ')[1]; 
-                    const absoluteCp = sideToMove === 'b' ? -cp : cp; 
-                    
-                    moveHistory[bgMoveIndex].eval = absoluteCp;
+            if ((line.includes('score cp') || line.includes('score mate')) && isAnalyzingGame) {
+                const cpMatch = line.match(/score cp (-?\d+)/);
+                const mateMatch = line.match(/score mate (-?\d+)/);
+                
+                if ((cpMatch || mateMatch) && bgMoveIndex >= -1 && bgMoveIndex < moveHistory.length) {
+                    let cp = 0;
+                    if (cpMatch) {
+                        cp = parseInt(cpMatch[1]);
+                    } else if (mateMatch) {
+                        const mateIn = parseInt(mateMatch[1]);
+                        cp = mateIn > 0 ? 10000 - mateIn * 10 : -10000 - mateIn * 10;
+                    }
 
-                    if (bgMoveIndex > 0 && moveHistory[bgMoveIndex - 1].eval !== undefined) {
-                        const prevEval = moveHistory[bgMoveIndex - 1].eval!;
-                        const diff = absoluteCp - prevEval;
-
-                        let pawnLoss = sideToMove === 'w' ? diff / 100 : -diff / 100;
-                        let classification: MoveRecord['classification'] = 'good';
+                    let absoluteCp;
+                    if (bgMoveIndex === -1) {
+                        startEval = cp; // Store the start position baseline
+                    } else {
+                        const sideToMove = moveHistory[bgMoveIndex].fen.split(' ')[1]; 
+                        absoluteCp = sideToMove === 'b' ? -cp : cp; 
                         
-                        // REDUCED CLASSIFICATION THRESHOLDS
-                        if (pawnLoss <= -1.0) classification = 'brilliant'; 
-                        else if (pawnLoss <= 0.05) classification = 'best'; 
-                        else if (pawnLoss <= 0.5) classification = 'good';
-                        else if (pawnLoss <= 1.0) classification = 'inaccuracy';
-                        else if (pawnLoss <= 2.0) classification = 'mistake';
-                        else classification = 'blunder';
+                        moveHistory[bgMoveIndex].eval = absoluteCp;
 
-                        moveHistory[bgMoveIndex].classification = classification;
+                        // Compare against startEval for the first move, otherwise use previous move
+                        const prevEval = bgMoveIndex === 0 ? startEval : moveHistory[bgMoveIndex - 1].eval;
+                        
+                        if (prevEval !== undefined) {
+                            const diff = absoluteCp - prevEval;
+                            let pawnLoss = sideToMove === 'w' ? diff / 100 : -diff / 100;
+                            let classification: MoveRecord['classification'] = 'good';
+                            
+                            if (pawnLoss <= -1.0) classification = 'brilliant';
+                            else if (pawnLoss <= 0.05) classification = 'best'; 
+                            else if (pawnLoss <= 0.5) classification = 'good';
+                            else if (pawnLoss <= 1.0) classification = 'inaccuracy';
+                            else if (pawnLoss <= 2.0) classification = 'mistake';
+                            else classification = 'blunder';
+
+                            moveHistory[bgMoveIndex].classification = classification;
+                        }
                     }
                 }
             }
@@ -147,33 +156,12 @@
                     bgEngine.postMessage(`position fen ${moveHistory[bgMoveIndex].fen}`);
                     bgEngine.postMessage('go depth 10'); 
                 } else {
-                    isAnalyzingGame = false; 
-                    calculateAccuracy(); 
+                    isAnalyzingGame = false;
                 }
             }
         };
         bgEngine.postMessage('uci');
     });
-
-    function calculateAccuracy() {
-        let whiteLoss = 0; let blackLoss = 0; let whiteMoves = 0; let blackMoves = 0;
-        for (let i = 1; i < moveHistory.length; i++) {
-            if (moveHistory[i].eval !== undefined && moveHistory[i - 1].eval !== undefined) {
-                const prevEval = moveHistory[i - 1].eval!;
-                const currEval = moveHistory[i].eval!;
-                const diff = currEval - prevEval;
-                const isWhiteMove = i % 2 !== 0; 
-
-                if (isWhiteMove) { whiteLoss += Math.max(0, -diff); whiteMoves++; } 
-                else { blackLoss += Math.max(0, diff); blackMoves++; }
-            }
-        }
-        const avgWhiteLossCP = whiteMoves > 0 ? whiteLoss / whiteMoves : 0;
-        const avgBlackLossCP = blackMoves > 0 ? blackLoss / blackMoves : 0;
-        
-        whiteAccuracy = Math.max(10, Math.min(100, Math.round(100 * Math.exp(-0.005 * avgWhiteLossCP))));
-        blackAccuracy = Math.max(10, Math.min(100, Math.round(100 * Math.exp(-0.005 * avgBlackLossCP))));
-    }
 
     function loadGame(game: any) {
         currentGame = game;
@@ -185,18 +173,16 @@
             chess.move(move);
             return { fen: chess.fen(), san: move.san, lastMove: [move.from, move.to] as [string, string] };
         });
-        
+
         currentMoveIndex = -1;
         fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"; 
         explanation = ""; 
-        bestMoveShape = [];
-        whiteAccuracy = 0;
-        blackAccuracy = 0;
 
         let archiveOwner = (data.currentUsername || '').toLowerCase().trim();
         if (!archiveOwner && data.games && data.games.length > 0) {
             if (data.games.length > 1) {
-                const g1 = data.games[0]; const g2 = data.games[1];
+                const g1 = data.games[0];
+                const g2 = data.games[1];
                 const g1Players = [g1.white.username.toLowerCase(), g1.black.username.toLowerCase()];
                 const g2Players = [g2.white.username.toLowerCase(), g2.black.username.toLowerCase()];
                 archiveOwner = g1Players.find(p => g2Players.includes(p)) || g1Players[0];
@@ -217,19 +203,18 @@
         setTimeout(() => {
             if (bgSessionId === currentBgSession) {
                 isAnalyzingGame = true;
-                bgMoveIndex = 0;
+                bgMoveIndex = -1; // CHANGE THIS FROM 0 TO -1
                 bgEngine.postMessage(`position fen ${fen}`);
                 bgEngine.postMessage('go depth 10');
             }
-        }, 150); 
+        }, 150);
     }
 
     function goToMove(index: number) {
         if (index >= -1 && index < moveHistory.length) {
             currentMoveIndex = index;
             fen = index >= 0 ? moveHistory[index].fen : "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-            bestMoveShape = []; 
-            explanation = ""; 
+            explanation = "";
             analyzeCurrentPosition();
         }
     }
@@ -239,7 +224,7 @@
 
     function analyzeCurrentPosition() {
         if (engine && isEngineReady) {
-            engine.postMessage('stop'); 
+            engine.postMessage('stop');
             clearTimeout(analysisTimer);
             analysisTimer = setTimeout(() => {
                 engine.postMessage(`position fen ${fen}`);
@@ -270,6 +255,70 @@
             explanation = "Network error. Make sure the API is running.";
         }
         isThinking = false;
+    }
+
+    // Calculate the points for the chess.com style advantage graph
+    let graphPolygon = $derived.by(() => {
+        if (moveHistory.length === 0) return "0,50 100,50 100,100 0,100";
+        let pts = [];
+        const total = moveHistory.length;
+        
+        // Start position eval Y coordinate
+        let startWp = 50 + 50 * (2 / (1 + Math.exp(-0.004 * startEval)) - 1);
+        let startY = 100 - startWp;
+        pts.push(`0,${startY}`);
+
+        for(let i = 0; i < total; i++) {
+            let cp = moveHistory[i].eval !== undefined ? moveHistory[i].eval! : startEval;
+            let wp = 50 + 50 * (2 / (1 + Math.exp(-0.004 * cp)) - 1);
+            let x = ((i + 1) / total) * 100;
+            let y = 100 - wp;
+            pts.push(`${x},${y}`);
+        }
+
+        // Close polygon to fill the bottom (Black's) area
+        pts.push(`100,100`);
+        pts.push(`0,100`);
+        return pts.join(" ");
+    });
+
+    // Calculate coordinates and colors for important move markers
+    let graphMarkers = $derived.by(() => {
+        let markers: { x: number, y: number, color: string }[] = [];
+        const total = moveHistory.length;
+        if (total === 0) return markers;
+
+        for (let i = 0; i < total; i++) {
+            const move = moveHistory[i];
+            // REMOVED 'best' to declutter the graph
+            if (move.classification && ['brilliant', 'inaccuracy', 'mistake', 'blunder'].includes(move.classification)) {
+                let cp = move.eval !== undefined ? move.eval : startEval;
+                let wp = 50 + 50 * (2 / (1 + Math.exp(-0.004 * cp)) - 1);
+                
+                let x = ((i + 1) / total) * 100;
+                let y = 100 - wp;
+                
+                let color = '#94a3b8'; // fallback
+                if (move.classification === 'blunder') color = '#ef4444';
+                else if (move.classification === 'mistake') color = '#fb923c';
+                else if (move.classification === 'inaccuracy') color = '#facc15';
+                else if (move.classification === 'brilliant') color = '#2dd4bf';
+
+                markers.push({ x, y, color });
+            }
+        }
+        return markers;
+    });
+
+    function handleGraphClick(event: MouseEvent) {
+        if (moveHistory.length === 0) return;
+        const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const percentage = x / rect.width;
+        
+        const totalSteps = moveHistory.length; 
+        const targetStep = Math.round(percentage * totalSteps);
+        goToMove(targetStep - 1);
     }
 </script>
 
@@ -312,11 +361,9 @@
             {#if currentGame}
                 {@const topPlayer = boardOrientation === 'white' ? currentGame.black : currentGame.white}
                 {@const topColor = boardOrientation === 'white' ? 'black' : 'white'}
-                {@const topAccuracy = boardOrientation === 'white' ? blackAccuracy : whiteAccuracy}
                 {@render userIcon(topColor)} 
                 <span class="username">{topPlayer.username}</span> 
                 <span class="rating">({topPlayer.rating})</span>
-                {#if topAccuracy > 0}<span class="accuracy-badge">{topAccuracy}%</span>{/if}
             {:else}
                 <span class="placeholder-text">Select a game from the archive to begin</span>
             {/if}
@@ -331,16 +378,44 @@
                 <Chessground {fen} orientation={boardOrientation} lastMove={currentHighlight as any} drawable={drawableConfig} />
             </div>
         </div>
+
+        <div class="graph-container">
+            <button class="graph-btn" aria-label="Evaluation Graph" onclick={handleGraphClick}>
+                <svg viewBox="0 0 100 100" preserveAspectRatio="none" class="eval-svg">
+                    <rect x="0" y="0" width="100" height="100" fill="#f1f5f9" />
+                    <polygon points={graphPolygon} fill="#334155" />
+                    <line x1="0" y1="50" x2="100" y2="50" stroke="#64748b" stroke-width="0.5" stroke-dasharray="2,2" />
+                    
+                    {#each graphMarkers as marker}
+                        <circle 
+                            cx={marker.x} 
+                            cy={marker.y} 
+                            r="1.5" 
+                            fill={marker.color} 
+                            stroke="#0f1115" 
+                            stroke-width="0.4" />
+                    {/each}
+                    
+                    {#if currentMoveIndex >= -1}
+                        <line 
+                            x1={((currentMoveIndex + 1) / Math.max(1, moveHistory.length)) * 100} 
+                            y1="0" 
+                            x2={((currentMoveIndex + 1) / Math.max(1, moveHistory.length)) * 100} 
+                            y2="100" 
+                            stroke="#3b82f6" 
+                            stroke-width="1.5" />
+                    {/if}
+                </svg>
+            </button>
+        </div>
         
         <div class="player-nameplate">
             {#if currentGame}
                 {@const botPlayer = boardOrientation === 'white' ? currentGame.white : currentGame.black}
                 {@const botColor = boardOrientation === 'white' ? 'white' : 'black'}
-                {@const botAccuracy = boardOrientation === 'white' ? whiteAccuracy : blackAccuracy}
                 {@render userIcon(botColor)} 
                 <span class="username">{botPlayer.username}</span> 
                 <span class="rating">({botPlayer.rating})</span>
-                {#if botAccuracy > 0}<span class="accuracy-badge">{botAccuracy}%</span>{/if}
             {/if}
         </div>
     </section>
@@ -383,6 +458,11 @@
                         
                         <button class="move-btn {currentMoveIndex === pair.whiteIndex ? 'active' : ''}" onclick={() => goToMove(pair.whiteIndex)}>
                             <span class="san-text">{pair.white.san}</span>
+                            
+                            {#if pair.white.eval !== undefined}
+                                <span class="eval-text">{pair.white.eval > 0 ? '+' : ''}{(pair.white.eval / 100).toFixed(2)}</span>
+                            {/if}
+
                             {#if pair.white.classification === 'blunder'}<span class="badge blunder">??</span>
                             {:else if pair.white.classification === 'mistake'}<span class="badge mistake">?</span>
                             {:else if pair.white.classification === 'inaccuracy'}<span class="badge inaccuracy">?!</span>
@@ -394,6 +474,11 @@
                         {#if pair.black}
                             <button class="move-btn {currentMoveIndex === pair.blackIndex ? 'active' : ''}" onclick={() => goToMove(pair.blackIndex)}>
                                 <span class="san-text">{pair.black.san}</span>
+                                
+                                {#if pair.black.eval !== undefined}
+                                    <span class="eval-text">{pair.black.eval > 0 ? '+' : ''}{(pair.black.eval / 100).toFixed(2)}</span>
+                                {/if}
+
                                 {#if pair.black.classification === 'blunder'}<span class="badge blunder">??</span>
                                 {:else if pair.black.classification === 'mistake'}<span class="badge mistake">?</span>
                                 {:else if pair.black.classification === 'inaccuracy'}<span class="badge inaccuracy">?!</span>
@@ -410,24 +495,11 @@
 </main>
 
 <style>
-    /* 4. FORCE ARROWS TO RENDER VISIBLY */
-    :global(.cg-wrap svg.cg-shapes g) {
-        fill: #22c55e !important;
-        stroke: #22c55e !important;
-        opacity: 0.8;
-    }
-    :global(.cg-wrap svg.cg-shapes polygon), 
-    :global(.cg-wrap svg.cg-shapes line),
-    :global(.cg-wrap svg.cg-shapes path) {
-        fill: #22c55e !important;
-        stroke: #22c55e !important;
-    }
-
     :global(body) { 
-        margin: 0; 
+        margin: 0;
         background-color: #0f1115; 
         color: #e2e8f0; 
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     
     .dashboard { display: flex; gap: 24px; padding: 30px; max-width: 1350px; margin: 0 auto; min-height: 100vh; box-sizing: border-box; }
@@ -458,7 +530,16 @@
     .eval-fill { width: 100%; background: #f1f5f9; transition: height 0.4s cubic-bezier(0.4, 0, 0.2, 1); }
     .eval-score-pill { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); font-family: monospace; font-size: 0.75rem; font-weight: 700; color: #64748b; background: rgba(15, 17, 21, 0.8); padding: 2px 4px; border-radius: 4px; z-index: 10; }
     .board-wrapper { width: 512px; height: 512px; }
-    .analysis-hub { width: 340px; display: flex; flex-direction: column; gap: 20px; }
+    .analysis-hub { 
+        width: 340px; 
+        display: flex; 
+        flex-direction: column; 
+        gap: 20px; 
+        /* Add these bounds to force scrolling */
+        height: calc(100vh - 60px); 
+        position: sticky; 
+        top: 30px; 
+    }
     .coach-card { background: #181a20; padding: 20px; border-radius: 12px; border: 1px solid #2b2f36; border-top: 4px solid #3b82f6; }
     .coach-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
     .coach-header h3 { margin: 0; display: flex; align-items: center; gap: 8px; color: #e2e8f0; font-size: 1.05rem; }
@@ -468,7 +549,17 @@
     
     .move-status-text { font-weight: 800; font-size: 1.1rem; margin-bottom: 8px; text-transform: capitalize; }
     .coach-text { color: #94a3b8; line-height: 1.6; margin: 0; font-size: 0.95rem;}
-    .notation-panel { background: #181a20; border-radius: 12px; border: 1px solid #2b2f36; display: flex; flex-direction: column; flex-grow: 1; overflow: hidden; }
+    .notation-panel { 
+            background: #181a20; 
+            border-radius: 12px; 
+            border: 1px solid #2b2f36; 
+            display: flex; 
+            flex-direction: column; 
+            flex-grow: 1; 
+            overflow: hidden; 
+            /* Add this to let flexbox calculate the internal scroll height */
+            min-height: 0; 
+    }    
     .controls { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #2b2f36; background: #13151a;}
     .move-counter { font-weight: 600; color: #94a3b8; font-size: 0.95rem;}
     .nav-btn { background: #334155; color: #f8fafc; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: background 0.2s; }
@@ -490,13 +581,109 @@
 
     /* REDUCED DYNAMIC COLORS */
     .brilliant { color: #2dd4bf; } .badge.brilliant { background: #2dd4bf; font-size: 0.7rem; color: #000;} 
-    .best { color: #22c55e; }      .badge.best { background: #22c55e; font-size: 0.9rem;} 
+    .best { color: #22c55e; }      .badge.best { background: #22c55e; font-size: 0.9rem; color: #000;} 
     .good { color: #94a3b8; }      .badge.good { background: #94a3b8; color: #000;} 
     .inaccuracy { color: #facc15; } .badge.inaccuracy { background: #facc15; color: #000; font-size: 0.65rem;} 
     .mistake { color: #fb923c; }   .badge.mistake { background: #fb923c; color: #000;} 
-    .blunder { color: #ef4444; }   .badge.blunder { background: #ef4444; font-size: 0.7rem;} 
+    .blunder { color: #ef4444; }   .badge.blunder { background: #ef4444; font-size: 0.7rem; color: #000;} 
 
-    .badge { width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; font-weight: 800; margin-left: auto; flex-shrink: 0; }
-    .san-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .accuracy-badge { margin-left: auto; background: rgba(59, 130, 246, 0.15); color: #60a5fa; padding: 4px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: 700; border: 1px solid rgba(59, 130, 246, 0.3); }
+    .badge { 
+        width: 22px; 
+        height: 22px; 
+        min-width: 22px; /* CRITICAL: Forces it to stay perfectly round */
+        min-height: 22px; /* CRITICAL: Prevents vertical squishing */
+        display: inline-flex; 
+        align-items: center; 
+        justify-content: center; 
+        border-radius: 50%; 
+        font-weight: 800; 
+        flex-shrink: 0; /* Prevents flexbox from crushing it */
+        line-height: 1; 
+        margin-left: 4px;
+    }
+
+    .eval-text { 
+        font-family: monospace; 
+        font-size: 0.8rem; 
+        color: #64748b; 
+        font-weight: 600; 
+        flex-shrink: 0; /* Prevents the score from wrapping/squishing */
+    }
+
+    .move-btn.active .eval-text { 
+        color: #93c5fd; 
+    }
+
+    .main-stage { 
+        flex-grow: 1; 
+        display: flex; 
+        flex-direction: column; 
+        gap: 12px; 
+        align-items: center; 
+        /* Slightly wider to accommodate the gap */
+        max-width: 560px; 
+    }
+
+    .board-layout { 
+        display: flex; 
+        /* This separates the eval bar from the board */
+        gap: 16px; 
+    }
+
+    .eval-bar { 
+        width: 30px; /* Made slightly wider */
+        height: 512px; 
+        background: #181a20; 
+        position: relative; 
+        display: flex; 
+        flex-direction: column-reverse; 
+        border-radius: 6px;
+        overflow: hidden;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+
+    .board-wrapper { 
+        width: 512px; 
+        height: 512px; 
+        border-radius: 6px;
+        overflow: hidden;
+        box-shadow: 0 12px 30px rgba(0,0,0,0.6);
+    }
+
+    .graph-container {
+        width: 100%;
+        height: 80px; /* Increased from 50px */
+        margin-top: 4px;
+        border-radius: 6px;
+        overflow: hidden;
+        background: #181a20;
+        border: 1px solid #2b2f36;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    
+    .graph-btn {
+        width: 100%;
+        height: 100%;
+        padding: 0;
+        margin: 0;
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        display: block;
+    }
+    
+    .eval-svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+    }
+    
+    .san-text { 
+        white-space: nowrap; 
+        overflow: hidden; 
+        text-overflow: ellipsis; 
+        flex-grow: 1; /* Pushes the eval score and badge to the right */
+    }
+
+    
 </style>
